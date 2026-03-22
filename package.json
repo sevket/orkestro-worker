@@ -1,0 +1,21 @@
+{
+  "name": "orkestro-worker",
+  "version": "1.0.0",
+  "description": "Orkestro AI Agent Worker",
+  "type": "module",
+  "main": "src/worker.ts",
+  "scripts": {
+    "start": "tsx src/worker.ts",
+    "dev": "tsx watch src/worker.ts"
+  },
+  "dependencies": {
+    "bullmq": "^5.71.0",
+    "ioredis": "^5.10.0",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "tsx": "^4.21.0",
+    "typescript": "~5.9.3"
+  }
+}
