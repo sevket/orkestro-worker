@@ -24,8 +24,9 @@ export class JsonLogSimplifier extends Transform {
       } else if (ev.content_block?.type === "text") {
         return this.formatBlock("Assistant");
       }
-    } else if (ev?.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-      return ev.delta.text;
+    } else if (ev?.type === "content_block_delta") {
+      if (ev.delta?.type === "text_delta") return ev.delta.text;
+      if (ev.delta?.type === "input_json_delta") return ev.delta.partial_json;
     }
     return null;
   }
