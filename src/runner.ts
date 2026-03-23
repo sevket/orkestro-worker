@@ -8,6 +8,7 @@ import { Transform } from "node:stream";
  */
 export class JsonLogSimplifier extends Transform {
   private buffer = "";
+  private toolMap = new Map<string, string>();
 
   private divider = "────────────────────────────────────────";
 
@@ -20,7 +21,9 @@ export class JsonLogSimplifier extends Transform {
   private processStreamEvent(ev: any): string | null {
     if (ev?.type === "content_block_start") {
       if (ev.content_block?.type === "tool_use") {
-        return this.formatBlock(`Tool Use: ${ev.content_block.name}`);
+        const tName = ev.content_block.name;
+        this.toolMap.set(ev.content_block.id, tName);
+        return this.formatBlock(`Tool: "${tName}"`);
       } else if (ev.content_block?.type === "text") {
         return this.formatBlock("Assistant");
       }
@@ -38,9 +41,11 @@ export class JsonLogSimplifier extends Transform {
     
     for (const item of items) {
       if (item.type === "tool_result") {
+        const tName = this.toolMap.get(item.tool_use_id) || "Unknown Tool";
+        this.toolMap.delete(item.tool_use_id);
         let resStr = typeof item.content === "string" ? item.content : JSON.stringify(item.content || "");
         if (resStr.length > 500) resStr = resStr.substring(0, 500) + "...";
-        output += this.formatBlock("Tool Result", resStr.replace(/\\n/g, "\n"));
+        output += this.formatBlock(`Result: "${tName}"`, resStr.replace(/\\n/g, "\n"));
       } else if (item.type === "text") {
         output += this.formatBlock("User", String(item.text));
       }
