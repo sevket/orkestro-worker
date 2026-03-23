@@ -1,5 +1,11 @@
 import { Transform } from "node:stream";
 
+/**
+ * AI Context:
+ * LLM CLI araçlarından (ornegin; claude, opencode) gelen karmaşık/gürültülü JSON Stream loglarını yakalar,
+ * gereksiz system event'lerini filtreleyerek sadece Orkestro Dashboard UI'sında gösterilecek profesyonel
+ * "Tool Use", "Assistant", "Tool Result" vs. saf block çıktılarına string olarak formatlayıp dönüştürür.
+ */
 export class JsonLogSimplifier extends Transform {
   private buffer = "";
 

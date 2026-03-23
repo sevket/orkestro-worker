@@ -20,6 +20,11 @@ const __server_dirname = path.dirname(fileURLToPath(import.meta.url));
 const capacitySlots = new Set<number>();
 const capacityEmitter = new EventEmitter();
 
+/**
+ * AI Context: 
+ * Eşzamanlı (Concurrency) işlemlerin donanımı kilitlememesi için geliştirilmiş bir Semaphore (Slot) mekanizması.
+ * Kapasite doluysa, yeni BullMQ görevlerini boş bir slot (yuva) açılana kadar asenkron olarak bekletir.
+ */
 async function waitAndAcquireSlot(max: number): Promise<number> {
   const tryAcquire = () => {
     for (let i = 1; i <= max; i++) {
@@ -75,6 +80,11 @@ try {
 const redisUrl = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
 
+/**
+ * AI Context:
+ * Worker'ın barındırıldığı sunucunun donanım kaynaklarına (CPU ve RAM) göre otonom kapasite hesaplar.
+ * V8/Node.js süreçlerinin OOM (Out Of Memory) çöküşünü önlemek adına her yerel AI ajanına ortalama 1.5GB RAM limiti varsayılır.
+ */
 export const WORKER_REQUESTED_CAPACITY = Number(process.env.WORKER_CAPACITY || "4");
 const _cpus = os.cpus().length;
 const _freeMemGB = os.freemem() / (1024 * 1024 * 1024);
@@ -93,21 +103,26 @@ if (WORKER_REQUESTED_CAPACITY > WORKER_ASSIGNED_CAPACITY) {
 // Mappings for active processes to be killed remotely
 const activeProcesses = new Map<string, ChildProcess>();
 
+/**
+ * AI Context:
+ * Node.js'de process.kill(pid) sadece ana süreci öldürür ancak AI aracı CLI'ları (claude, opencode) kendi alt süreçlerini (child tree) oluşturur.
+ * Arkada yetim (orphan) kaynak sızıntısı bırakmamak için negatif PID (-pid) kullanılarak proses grubunu toptan sonlandırırız.
+ */
 function killPidTree(pid: number) {
   if (process.platform === "win32") {
-    try { execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { timeout: 5000 }, () => {}); } catch {}
+    try { execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { timeout: 5000 }, () => { }); } catch { }
   } else {
-    try { process.kill(-pid, "SIGTERM"); } catch {}
-    try { process.kill(pid, "SIGTERM"); } catch {}
+    try { process.kill(-pid, "SIGTERM"); } catch { }
+    try { process.kill(pid, "SIGTERM"); } catch { }
   }
 }
 
 async function discoverCapabilities() {
   const capabilities: string[] = [];
-  try { const { stdout } = await execFileAsync("claude", ["--version"]); if (stdout.trim()) capabilities.push("claude"); } catch {}
-  try { const { stdout } = await execFileAsync("opencode", ["--version"]); if (stdout.trim()) capabilities.push("opencode"); } catch {}
-  try { const { stdout } = await execFileAsync("gemini", ["--version"]); if (stdout.trim()) capabilities.push("gemini"); } catch {}
-  
+  try { const { stdout } = await execFileAsync("claude", ["--version"]); if (stdout.trim()) capabilities.push("claude"); } catch { }
+  try { const { stdout } = await execFileAsync("opencode", ["--version"]); if (stdout.trim()) capabilities.push("opencode"); } catch { }
+  try { const { stdout } = await execFileAsync("gemini", ["--version"]); if (stdout.trim()) capabilities.push("gemini"); } catch { }
+
   return capabilities;
 }
 
@@ -133,25 +148,25 @@ function loadOrCreateWorkerId(): string {
 async function startWorker() {
   console.log("[Worker] Bootstrapping subsystem. Discovering native OS capabilities...");
   const capabilities = await discoverCapabilities();
-  
+
   if (capabilities.length === 0) {
     console.error("FATAL: No AI agents (claude, opencode, gemini) discovered. Refusing connection.");
     process.exit(1);
   }
-  
+
   console.log(`[Worker] Discovered capabilities: [${capabilities.join(", ")}]`);
   const workerId = loadOrCreateWorkerId();
   const masterUrl = process.env.MASTER_URL || "ws://127.0.0.1:8787";
-  
+
   console.log(`[Worker] Handshaking Master socket: ${masterUrl}`);
-  
+
   const socket = io(masterUrl, {
     query: {
       workerId,
       capabilities: JSON.stringify(capabilities),
       capacity: String(WORKER_ASSIGNED_CAPACITY),
       requestedCapacity: String(WORKER_REQUESTED_CAPACITY),
-      roles: process.env.WORKER_ROLES || '["coder"]'
+      roles: process.env.WORKER_ROLES || '["planner", "coder", "reviewer", "tester"]'
     }
   });
 
@@ -165,7 +180,7 @@ async function startWorker() {
     if (payload.action === "disconnect") {
       if (process.env.pm_id) {
         console.log(`[Worker] Halting local PM2 instance: ${process.env.pm_id}`);
-        execFile("npx", ["pm2", "stop", process.env.pm_id], () => {});
+        execFile("npx", ["pm2", "stop", process.env.pm_id], () => { });
       } else {
         process.exit(0);
       }
@@ -204,11 +219,11 @@ async function startWorker() {
   // Attach a BullMQ handler per capability
   const queuesToListen = [...capabilities];
   try {
-     const workerRoles = JSON.parse(process.env.WORKER_ROLES || '["coder"]');
-     if (workerRoles.includes("planner") && !queuesToListen.includes("planner")) {
-         queuesToListen.push("planner");
-     }
-  } catch(e) {}
+    const workerRoles = JSON.parse(process.env.WORKER_ROLES || '["coder"]');
+    if (workerRoles.includes("planner") && !queuesToListen.includes("planner")) {
+      queuesToListen.push("planner");
+    }
+  } catch (e) { }
 
   for (const agent of queuesToListen) {
     const queueName = `fleet-${agent}`;
@@ -217,36 +232,36 @@ async function startWorker() {
     new Worker(queueName, async (job) => {
       const { cardId, prompt, projectPath: rawProjectPath, args, isReview, repo, role } = job.data;
       const jobIdentifier = isReview ? `${cardId}_review` : cardId;
-      
+
       let projectPath = rawProjectPath;
       const workerCapacity = WORKER_ASSIGNED_CAPACITY;
       const slot = await waitAndAcquireSlot(workerCapacity);
-      
+
       let finalPrompt = prompt;
       let targetRole = isReview ? "reviewer" : role;
       let myPersona: any = null;
       let searchRole = targetRole || "coder";
       if (searchRole === "frontend" || searchRole === "backend") searchRole = "coder";
-      myPersona = workerPersonas.find(p => p.role === searchRole && !p.is_busy) || 
-                  workerPersonas.find(p => p.role === searchRole) || 
-                  workerPersonas.find(p => !p.is_busy) || 
-                  workerPersonas[0];
+      myPersona = workerPersonas.find(p => p.role === searchRole && !p.is_busy) ||
+        workerPersonas.find(p => p.role === searchRole) ||
+        workerPersonas.find(p => !p.is_busy) ||
+        workerPersonas[0];
       if (myPersona) {
-         myPersona.is_busy = true;
-         socket.emit("persona_busy", { personaId: myPersona.id, isBusy: true, jobId: jobIdentifier });
-         console.log(`[Worker - Slot ${slot}] Adopting Persona context: ${myPersona.name} (${myPersona.role})`);
-         finalPrompt = `### SYSTEM PERSONA ###\n${myPersona.prompt}\n\n### TASK INSTRUCTIONS ###\n${prompt}`;
+        myPersona.is_busy = true;
+        socket.emit("persona_busy", { personaId: myPersona.id, isBusy: true, jobId: jobIdentifier });
+        console.log(`[Worker - Slot ${slot}] Adopting Persona context: ${myPersona.name} (${myPersona.role})`);
+        finalPrompt = `### SYSTEM PERSONA ###\n${myPersona.prompt}\n\n### TASK INSTRUCTIONS ###\n${prompt}`;
       }
-      
+
       const isolatedLabel = myPersona ? myPersona.id : `${workerId}-${slot}-${jobIdentifier}`;
-      
+
       if (repo && repo.gitUrl && repo.name) {
         const projectsDir = path.resolve(process.cwd(), "projects", isolatedLabel);
         if (!fs.existsSync(projectsDir)) fs.mkdirSync(projectsDir, { recursive: true });
-        
+
         const targetDir = path.join(projectsDir, repo.name);
         projectPath = targetDir;
-        
+
         try {
           if (!fs.existsSync(targetDir)) {
             console.log(`[Worker - Slot ${slot}] Git target missing. Cloning ${repo.gitUrl} -> ${targetDir}...`);
@@ -278,10 +293,10 @@ async function startWorker() {
         activeProcesses.set(jobIdentifier, child);
 
         const releasePersona = () => {
-           if (myPersona) {
-              myPersona.is_busy = false;
-              socket.emit("persona_busy", { personaId: myPersona.id, isBusy: false, jobId: null });
-           }
+          if (myPersona) {
+            myPersona.is_busy = false;
+            socket.emit("persona_busy", { personaId: myPersona.id, isBusy: false, jobId: null });
+          }
         };
 
         child.on("error", (err) => {
@@ -311,40 +326,48 @@ async function startWorker() {
 
         child.on("close", (code) => {
           releasePersona();
-          
+
           if (targetRole === 'planner' && code === 0) {
-              console.log(`[Worker] Planner finished. Parsing JSON tasks...`);
-              let jsonStr = "";
-              const customMatch = fullOutputBuffer.match(/\[JSON_TASKS_START\]([\s\S]*?)\[JSON_TASKS_END\]/);
-              if (customMatch && customMatch[1]) {
-                  jsonStr = customMatch[1].trim();
+            console.log(`[Worker] Planner finished. Parsing JSON tasks...`);
+            /**
+             * AI Context:
+             * Yapay zekalar non-deterministik çıktılar üretebildiği için her zaman saf JSON dönmeyebilirler.
+             * Sistemin direncini artırmak için sırasıyla 3 aşamalı Fallback (yedek) regex Regex çıkarma mekanizması çalışır:
+             * 1. JSON_TASKS_START özel etiketi aranır.
+             * 2. Bulunamazsa Markdown JSON bloğu (```json) aranır
+             * 3. Hiçbiri yoksa ham JSON Array [...] motifi parse edilir.
+             */
+            let jsonStr = "";
+            const customMatch = fullOutputBuffer.match(/\[JSON_TASKS_START\]([\s\S]*?)\[JSON_TASKS_END\]/);
+            if (customMatch && customMatch[1]) {
+              jsonStr = customMatch[1].trim();
+            } else {
+              // Fallback: Claude sometimes ignores the custom tags and wraps it in a markdown json block
+              const mdMatch = fullOutputBuffer.match(/```json\s*([\s\S]*?)\s*```/);
+              if (mdMatch && mdMatch[1]) {
+                jsonStr = mdMatch[1].trim();
               } else {
-                  // Fallback: Claude sometimes ignores the custom tags and wraps it in a markdown json block
-                  const mdMatch = fullOutputBuffer.match(/```json\s*([\s\S]*?)\s*```/);
-                  if (mdMatch && mdMatch[1]) {
-                      jsonStr = mdMatch[1].trim();
-                  } else {
-                      // Second fallback: Maybe it just spit out the JSON array directly
-                      const arrayMatch = fullOutputBuffer.match(/\[\s*\{[\s\S]*\}\s*\]/);
-                      if (arrayMatch && arrayMatch[0]) {
-                          jsonStr = arrayMatch[0].trim();
-                      }
-                  }
+                // Second fallback: Maybe it just spit out the JSON array directly
+                const arrayMatch = fullOutputBuffer.match(/\[\s*\{[\s\S]*\}\s*\]/);
+                if (arrayMatch && arrayMatch[0]) {
+                  jsonStr = arrayMatch[0].trim();
+                }
               }
-              
-              if (jsonStr) {
-                  try {
-                      const tasksArray = JSON.parse(jsonStr);
-                      if (Array.isArray(tasksArray) && tasksArray.length > 0) {
-                          console.log(`[Worker] Parsed ${tasksArray.length} tasks from Planner. Emitting to Master...`);
-                          socket.emit("planner_generated_tasks", { parentId: job.id, tasks: tasksArray });
-                      }
-                  } catch(e) { console.error("[Worker] Failed to parse Planner JSON block!", e, "String was:", jsonStr.substring(0, 100)); }
-              } else {
-                  console.log("[Worker] No valid JSON task block found in Planner output.");
-              }
+            }
+
+            if (jsonStr) {
+              try {
+                const tasksArray = JSON.parse(jsonStr);
+                if (Array.isArray(tasksArray) && tasksArray.length > 0) {
+                  console.log(`[Worker] Parsed ${tasksArray.length} tasks from Planner. Emitting to Master...`);
+                  socket.emit("planner_generated_tasks", { parentId: job.id, tasks: tasksArray });
+                }
+              } catch (e) { console.error("[Worker] Failed to parse Planner JSON block!", e, "String was:", jsonStr.substring(0, 100)); }
+            } else {
+              console.log("[Worker] No valid JSON task block found in Planner output.");
+            }
           }
-          
+
           // The AI agent is responsible for Git commits and pushes via the augmented prompt rule.
           activeProcesses.delete(jobIdentifier);
           releaseSlot(slot);
@@ -354,8 +377,8 @@ async function startWorker() {
           else reject(new Error(`Agent exited with code ${code}`));
         });
       });
-    }, { 
-      connection: connection as any, 
+    }, {
+      connection: connection as any,
       concurrency: WORKER_ASSIGNED_CAPACITY,
       lockDuration: 120000 // AI spawn tasks often block machine limits, preventing default 30s lock renewals
     });
