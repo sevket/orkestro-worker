@@ -226,18 +226,18 @@ function extractPlannerTasks(fullOutputBuffer: string): any[] | null {
       if (Array.isArray(tasksArray) && tasksArray.length > 0) {
         return tasksArray;
       }
-    } catch (e: any) { 
-      console.error("[Worker] Failed to parse Planner JSON block!", e.message); 
+    } catch (e: any) {
+      console.error("[Worker] Failed to parse Planner JSON block!", e.message);
     }
   }
   return null;
 }
 
 async function spawnAgentProcess(
-  jobData: any, 
-  projectPath: string, 
-  socket: Socket, 
-  jobIdentifier: string, 
+  jobData: any,
+  projectPath: string,
+  socket: Socket,
+  jobIdentifier: string,
   finalPrompt: string
 ): Promise<{ code: number | null, outputBuffer: string }> {
 
@@ -296,7 +296,7 @@ async function startWorker() {
   const socket = setupMasterConnection(workerId, capabilities);
 
   let workerPersonas: any[] = [];
-  
+
   socket.on("master_command", (payload: { action: string }) => {
     console.log(`[Worker] Received remote fleet command: ${payload.action}`);
     if (payload.action === "disconnect") {
@@ -358,12 +358,12 @@ async function startWorker() {
       let targetRole = isReview ? "reviewer" : role;
       let searchRole = targetRole || "coder";
       if (searchRole === "frontend" || searchRole === "backend") searchRole = "coder";
-      
+
       const myPersona = workerPersonas.find(p => p.role === searchRole && !p.is_busy) ||
         workerPersonas.find(p => p.role === searchRole) ||
         workerPersonas.find(p => !p.is_busy) ||
         workerPersonas[0];
-        
+
       if (myPersona) {
         myPersona.is_busy = true;
         socket.emit("persona_busy", { personaId: myPersona.id, isBusy: true, jobId: jobIdentifier });
@@ -380,17 +380,17 @@ async function startWorker() {
 
       try {
         const isolatedLabel = myPersona ? myPersona.id : `${workerId}-${slot}-${jobIdentifier}`;
-        
+
         // 1. Repo hazırlığı (Dışarı çıkarılan fonksiyon)
         if (repo && repo.gitUrl && repo.name) {
           projectPath = await prepareGitWorkspace(repo, slot, isolatedLabel, socket, cardId);
         }
-        
+
         console.log(`[Worker - Slot ${slot}] Sourced job: ${jobIdentifier} (${agent}). Executing natively...`);
-        
+
         // 2. Ajanın terminalde çalıştırılması (Dışarı çıkarılan fonksiyon)
         const { code, outputBuffer } = await spawnAgentProcess(job.data, projectPath, socket, jobIdentifier, finalPrompt);
-        
+
         // 3. Planner Parse İşlemleri (Dışarı çıkarılan fonksiyon)
         if (targetRole === 'planner' && code === 0) {
           console.log(`[Worker] Planner finished. Parsing JSON tasks...`);
@@ -405,9 +405,9 @@ async function startWorker() {
 
         socket.emit("job_log", { cardId, author: "system", message: `\n[Local Agent Exit] code ${code}` });
         socket.emit("job_complete", { cardId, exitCode: code ?? 1, projectPath, isReview });
-        
+
         if (code !== 0) throw new Error(`Agent exited with code ${code}`);
-        
+
       } catch (err: any) {
         console.error(`[Worker - Slot ${slot}] Job Flow Error:`, err.message);
         throw err;
@@ -415,11 +415,11 @@ async function startWorker() {
         releasePersona();
         releaseSlot(slot);
       }
-      
+
     }, {
       connection: connection as any,
       concurrency: WORKER_ASSIGNED_CAPACITY,
-      lockDuration: 120000 
+      lockDuration: 120000
     });
   }
 }
