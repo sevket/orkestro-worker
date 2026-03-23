@@ -7,7 +7,7 @@ import fs from "node:fs";
 import { exec, execSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { JsonLogSimplifier } from "./agent-runner.js";
+import { JsonLogSimplifier } from "./runner.js";
 import { Worker } from "bullmq";
 import Redis from "ioredis";
 import { EventEmitter } from "node:events";
@@ -145,19 +145,8 @@ function loadOrCreateWorkerId(): string {
   return workerId;
 }
 
-async function startWorker() {
-  console.log("[Worker] Bootstrapping subsystem. Discovering native OS capabilities...");
-  const capabilities = await discoverCapabilities();
-
-  if (capabilities.length === 0) {
-    console.error("FATAL: No AI agents (claude, opencode, gemini) discovered. Refusing connection.");
-    process.exit(1);
-  }
-
-  console.log(`[Worker] Discovered capabilities: [${capabilities.join(", ")}]`);
-  const workerId = loadOrCreateWorkerId();
+function setupMasterConnection(workerId: string, capabilities: string[]): Socket {
   const masterUrl = process.env.MASTER_URL || "ws://127.0.0.1:8787";
-
   console.log(`[Worker] Handshaking Master socket: ${masterUrl}`);
 
   const socket = io(masterUrl, {
@@ -175,6 +164,139 @@ async function startWorker() {
     socket.emit("worker_echo", `Worker ${workerId} is alive and ready to process jobs! (Capabilities: ${capabilities.join(", ")})`);
   });
 
+  socket.on("disconnect", (reason) => {
+    console.log(`[Worker] Disconnected from Master node [Reason: ${reason}]`);
+  });
+
+  return socket;
+}
+
+async function prepareGitWorkspace(repo: any, slot: number, isolatedLabel: string, socket: Socket, cardId: string): Promise<string> {
+  const projectsDir = path.resolve(process.cwd(), "projects", isolatedLabel);
+  if (!fs.existsSync(projectsDir)) fs.mkdirSync(projectsDir, { recursive: true });
+
+  const targetDir = path.join(projectsDir, repo.name);
+
+  try {
+    if (!fs.existsSync(targetDir)) {
+      console.log(`[Worker - Slot ${slot}] Git target missing. Cloning ${repo.gitUrl} -> ${targetDir}...`);
+      await execAsync(`git clone ${repo.gitUrl} ${repo.name}`, { cwd: projectsDir });
+    } else {
+      console.log(`[Worker - Slot ${slot}] Git target exists. Pulling latest commits...`);
+      await execAsync(`git fetch --all && git reset --hard origin/main`, { cwd: targetDir });
+    }
+    await execAsync(`git config user.name "Orkestro Agent" && git config user.email "agent@orkestro.io"`, { cwd: targetDir });
+    await execAsync(`git checkout main || true`, { cwd: targetDir });
+  } catch (e: any) {
+    console.error(`[Worker - Slot ${slot}] FATAL: Git sync collapsed on ${repo.name} - ${e.message}`);
+    socket.emit("job_log", { cardId, author: "system", message: `Worker Git checkout failed: ${e.message}` });
+    throw e;
+  }
+  return targetDir;
+}
+
+function extractPlannerTasks(fullOutputBuffer: string): any[] | null {
+  /**
+   * AI Context:
+   * Yapay zekalar non-deterministik çıktılar üretebildiği için her zaman saf JSON dönmeyebilirler.
+   * Sistemin direncini artırmak için sırasıyla 3 aşamalı Fallback (yedek) regex Regex çıkarma mekanizması çalışır:
+   * 1. JSON_TASKS_START özel etiketi aranır.
+   * 2. Bulunamazsa Markdown JSON bloğu (```json) aranır
+   * 3. Hiçbiri yoksa ham JSON Array [...] motifi parse edilir.
+   */
+  let jsonStr = "";
+  const customMatch = fullOutputBuffer.match(/\[JSON_TASKS_START\]([\s\S]*?)\[JSON_TASKS_END\]/);
+  if (customMatch && customMatch[1]) {
+    jsonStr = customMatch[1].trim();
+  } else {
+    const mdMatch = fullOutputBuffer.match(/```json\s*([\s\S]*?)\s*```/);
+    if (mdMatch && mdMatch[1]) {
+      jsonStr = mdMatch[1].trim();
+    } else {
+      const arrayMatch = fullOutputBuffer.match(/\[\s*\{[\s\S]*\}\s*\]/);
+      if (arrayMatch && arrayMatch[0]) {
+        jsonStr = arrayMatch[0].trim();
+      }
+    }
+  }
+
+  if (jsonStr) {
+    try {
+      const tasksArray = JSON.parse(jsonStr);
+      if (Array.isArray(tasksArray) && tasksArray.length > 0) {
+        return tasksArray;
+      }
+    } catch (e: any) { 
+      console.error("[Worker] Failed to parse Planner JSON block!", e.message); 
+    }
+  }
+  return null;
+}
+
+async function spawnAgentProcess(
+  jobData: any, 
+  projectPath: string, 
+  socket: Socket, 
+  jobIdentifier: string, 
+  finalPrompt: string
+): Promise<{ code: number | null, outputBuffer: string }> {
+
+  return new Promise((resolve, reject) => {
+    const { cardId, args } = jobData;
+    const child = spawn(args[0], args.slice(1), {
+      cwd: projectPath,
+      shell: process.platform === "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+      windowsHide: true,
+    });
+
+    activeProcesses.set(jobIdentifier, child);
+
+    child.on("error", (err) => {
+      socket.emit("job_log", { cardId, chunk: `\n[Worker] SPAWN ERROR: ${err.message}\n` });
+      activeProcesses.delete(jobIdentifier);
+      reject(err);
+    });
+
+    if (child.stdin) {
+      child.stdin.write(finalPrompt);
+      child.stdin.end();
+    }
+
+    const simplifier = new JsonLogSimplifier();
+    if (child.stdout) child.stdout.pipe(simplifier);
+    if (child.stderr) child.stderr.pipe(simplifier);
+
+    let fullOutputBuffer = "";
+    simplifier.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      socket.emit("job_log", { cardId, chunk: text });
+      fullOutputBuffer += text;
+    });
+
+    child.on("close", (code) => {
+      activeProcesses.delete(jobIdentifier);
+      resolve({ code, outputBuffer: fullOutputBuffer });
+    });
+  });
+}
+
+async function startWorker() {
+  console.log("[Worker] Bootstrapping subsystem. Discovering native OS capabilities...");
+  const capabilities = await discoverCapabilities();
+
+  if (capabilities.length === 0) {
+    console.error("FATAL: No AI agents (claude, opencode, gemini) discovered. Refusing connection.");
+    process.exit(1);
+  }
+
+  console.log(`[Worker] Discovered capabilities: [${capabilities.join(", ")}]`);
+  const workerId = loadOrCreateWorkerId();
+  const socket = setupMasterConnection(workerId, capabilities);
+
+  let workerPersonas: any[] = [];
+  
   socket.on("master_command", (payload: { action: string }) => {
     console.log(`[Worker] Received remote fleet command: ${payload.action}`);
     if (payload.action === "disconnect") {
@@ -194,10 +316,7 @@ async function startWorker() {
       setTimeout(() => socket.connect(), 1000);
     }
   });
-  socket.on("disconnect", (reason) => {
-    console.log(`[Worker] Disconnected from Master node [Reason: ${reason}]`);
-  });
-  let workerPersonas: any[] = [];
+
   socket.on("assigned_personas", (personas: any[]) => {
     workerPersonas = personas;
     const names = personas.map(p => p.name).join(", ");
@@ -205,7 +324,6 @@ async function startWorker() {
   });
 
   socket.on("kill_job", ({ cardId }) => {
-    // Both normal and review jobs may exist
     for (const key of [cardId, `${cardId}_review`]) {
       const child = activeProcesses.get(key);
       if (child && child.pid) {
@@ -216,7 +334,6 @@ async function startWorker() {
     }
   });
 
-  // Attach a BullMQ handler per capability
   const queuesToListen = [...capabilities];
   try {
     const workerRoles = JSON.parse(process.env.WORKER_ROLES || '["coder"]');
@@ -230,7 +347,7 @@ async function startWorker() {
     console.log(`[Worker] Listening on BullMQ Queue: ${queueName}`);
 
     new Worker(queueName, async (job) => {
-      const { cardId, prompt, projectPath: rawProjectPath, args, isReview, repo, role } = job.data;
+      const { cardId, prompt, projectPath: rawProjectPath, isReview, repo, role } = job.data;
       const jobIdentifier = isReview ? `${cardId}_review` : cardId;
 
       let projectPath = rawProjectPath;
@@ -239,13 +356,14 @@ async function startWorker() {
 
       let finalPrompt = prompt;
       let targetRole = isReview ? "reviewer" : role;
-      let myPersona: any = null;
       let searchRole = targetRole || "coder";
       if (searchRole === "frontend" || searchRole === "backend") searchRole = "coder";
-      myPersona = workerPersonas.find(p => p.role === searchRole && !p.is_busy) ||
+      
+      const myPersona = workerPersonas.find(p => p.role === searchRole && !p.is_busy) ||
         workerPersonas.find(p => p.role === searchRole) ||
         workerPersonas.find(p => !p.is_busy) ||
         workerPersonas[0];
+        
       if (myPersona) {
         myPersona.is_busy = true;
         socket.emit("persona_busy", { personaId: myPersona.id, isBusy: true, jobId: jobIdentifier });
@@ -253,134 +371,55 @@ async function startWorker() {
         finalPrompt = `### SYSTEM PERSONA ###\n${myPersona.prompt}\n\n### TASK INSTRUCTIONS ###\n${prompt}`;
       }
 
-      const isolatedLabel = myPersona ? myPersona.id : `${workerId}-${slot}-${jobIdentifier}`;
+      const releasePersona = () => {
+        if (myPersona) {
+          myPersona.is_busy = false;
+          socket.emit("persona_busy", { personaId: myPersona.id, isBusy: false, jobId: null });
+        }
+      };
 
-      if (repo && repo.gitUrl && repo.name) {
-        const projectsDir = path.resolve(process.cwd(), "projects", isolatedLabel);
-        if (!fs.existsSync(projectsDir)) fs.mkdirSync(projectsDir, { recursive: true });
-
-        const targetDir = path.join(projectsDir, repo.name);
-        projectPath = targetDir;
-
-        try {
-          if (!fs.existsSync(targetDir)) {
-            console.log(`[Worker - Slot ${slot}] Git target missing. Cloning ${repo.gitUrl} -> ${targetDir}...`);
-            await execAsync(`git clone ${repo.gitUrl} ${repo.name}`, { cwd: projectsDir });
+      try {
+        const isolatedLabel = myPersona ? myPersona.id : `${workerId}-${slot}-${jobIdentifier}`;
+        
+        // 1. Repo hazırlığı (Dışarı çıkarılan fonksiyon)
+        if (repo && repo.gitUrl && repo.name) {
+          projectPath = await prepareGitWorkspace(repo, slot, isolatedLabel, socket, cardId);
+        }
+        
+        console.log(`[Worker - Slot ${slot}] Sourced job: ${jobIdentifier} (${agent}). Executing natively...`);
+        
+        // 2. Ajanın terminalde çalıştırılması (Dışarı çıkarılan fonksiyon)
+        const { code, outputBuffer } = await spawnAgentProcess(job.data, projectPath, socket, jobIdentifier, finalPrompt);
+        
+        // 3. Planner Parse İşlemleri (Dışarı çıkarılan fonksiyon)
+        if (targetRole === 'planner' && code === 0) {
+          console.log(`[Worker] Planner finished. Parsing JSON tasks...`);
+          const tasks = extractPlannerTasks(outputBuffer);
+          if (tasks) {
+            console.log(`[Worker] Parsed ${tasks.length} tasks from Planner. Emitting to Master...`);
+            socket.emit("planner_generated_tasks", { parentId: job.id, tasks });
           } else {
-            console.log(`[Worker - Slot ${slot}] Git target exists. Pulling latest commits...`);
-            await execAsync(`git fetch --all && git reset --hard origin/main`, { cwd: targetDir });
+            console.log("[Worker] No valid JSON task block found in Planner output.");
           }
-          await execAsync(`git config user.name "Orkestro Agent" && git config user.email "agent@orkestro.io"`, { cwd: targetDir });
-          await execAsync(`git checkout main || true`, { cwd: targetDir });
-        } catch (e: any) {
-          console.error(`[Worker - Slot ${slot}] FATAL: Git sync collapsed on ${repo.name} - ${e.message}`);
-          socket.emit("job_log", { cardId, author: "system", message: `Worker Git checkout failed: ${e.message}` });
-          releaseSlot(slot);
-          throw e;
         }
+
+        socket.emit("job_log", { cardId, author: "system", message: `\n[Local Agent Exit] code ${code}` });
+        socket.emit("job_complete", { cardId, exitCode: code ?? 1, projectPath, isReview });
+        
+        if (code !== 0) throw new Error(`Agent exited with code ${code}`);
+        
+      } catch (err: any) {
+        console.error(`[Worker - Slot ${slot}] Job Flow Error:`, err.message);
+        throw err;
+      } finally {
+        releasePersona();
+        releaseSlot(slot);
       }
-      console.log(`[Worker - Slot ${slot}] Sourced job: ${jobIdentifier} (${agent}). Executing natively...`);
-
-      return new Promise<void>((resolve, reject) => {
-        const child = spawn(args[0], args.slice(1), {
-          cwd: projectPath,
-          shell: process.platform === "win32",
-          stdio: ["pipe", "pipe", "pipe"],
-          detached: process.platform !== "win32",
-          windowsHide: true,
-        });
-
-        activeProcesses.set(jobIdentifier, child);
-
-        const releasePersona = () => {
-          if (myPersona) {
-            myPersona.is_busy = false;
-            socket.emit("persona_busy", { personaId: myPersona.id, isBusy: false, jobId: null });
-          }
-        };
-
-        child.on("error", (err) => {
-          releasePersona();
-          socket.emit("job_log", { cardId, chunk: `\n[Worker] SPAWN ERROR: ${err.message}\n` });
-          activeProcesses.delete(jobIdentifier);
-          reject(err);
-        });
-
-        // Pipe stdin
-        if (child.stdin) {
-          child.stdin.write(finalPrompt);
-          child.stdin.end();
-        }
-
-        // Transform JSON chunks natively on edge worker before Network Emit
-        const simplifier = new JsonLogSimplifier();
-        if (child.stdout) child.stdout.pipe(simplifier);
-        if (child.stderr) child.stderr.pipe(simplifier);
-
-        let fullOutputBuffer = "";
-        simplifier.on("data", (chunk: Buffer) => {
-          const text = chunk.toString();
-          socket.emit("job_log", { cardId, chunk: text });
-          fullOutputBuffer += text;
-        });
-
-        child.on("close", (code) => {
-          releasePersona();
-
-          if (targetRole === 'planner' && code === 0) {
-            console.log(`[Worker] Planner finished. Parsing JSON tasks...`);
-            /**
-             * AI Context:
-             * Yapay zekalar non-deterministik çıktılar üretebildiği için her zaman saf JSON dönmeyebilirler.
-             * Sistemin direncini artırmak için sırasıyla 3 aşamalı Fallback (yedek) regex Regex çıkarma mekanizması çalışır:
-             * 1. JSON_TASKS_START özel etiketi aranır.
-             * 2. Bulunamazsa Markdown JSON bloğu (```json) aranır
-             * 3. Hiçbiri yoksa ham JSON Array [...] motifi parse edilir.
-             */
-            let jsonStr = "";
-            const customMatch = fullOutputBuffer.match(/\[JSON_TASKS_START\]([\s\S]*?)\[JSON_TASKS_END\]/);
-            if (customMatch && customMatch[1]) {
-              jsonStr = customMatch[1].trim();
-            } else {
-              // Fallback: Claude sometimes ignores the custom tags and wraps it in a markdown json block
-              const mdMatch = fullOutputBuffer.match(/```json\s*([\s\S]*?)\s*```/);
-              if (mdMatch && mdMatch[1]) {
-                jsonStr = mdMatch[1].trim();
-              } else {
-                // Second fallback: Maybe it just spit out the JSON array directly
-                const arrayMatch = fullOutputBuffer.match(/\[\s*\{[\s\S]*\}\s*\]/);
-                if (arrayMatch && arrayMatch[0]) {
-                  jsonStr = arrayMatch[0].trim();
-                }
-              }
-            }
-
-            if (jsonStr) {
-              try {
-                const tasksArray = JSON.parse(jsonStr);
-                if (Array.isArray(tasksArray) && tasksArray.length > 0) {
-                  console.log(`[Worker] Parsed ${tasksArray.length} tasks from Planner. Emitting to Master...`);
-                  socket.emit("planner_generated_tasks", { parentId: job.id, tasks: tasksArray });
-                }
-              } catch (e) { console.error("[Worker] Failed to parse Planner JSON block!", e, "String was:", jsonStr.substring(0, 100)); }
-            } else {
-              console.log("[Worker] No valid JSON task block found in Planner output.");
-            }
-          }
-
-          // The AI agent is responsible for Git commits and pushes via the augmented prompt rule.
-          activeProcesses.delete(jobIdentifier);
-          releaseSlot(slot);
-          socket.emit("job_log", { cardId, author: "system", message: `\n[Local Agent Exit] code ${code}` });
-          socket.emit("job_complete", { cardId, exitCode: code ?? 1, projectPath, isReview });
-          if (code === 0) resolve();
-          else reject(new Error(`Agent exited with code ${code}`));
-        });
-      });
+      
     }, {
       connection: connection as any,
       concurrency: WORKER_ASSIGNED_CAPACITY,
-      lockDuration: 120000 // AI spawn tasks often block machine limits, preventing default 30s lock renewals
+      lockDuration: 120000 
     });
   }
 }
