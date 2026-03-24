@@ -183,10 +183,10 @@ async function prepareGitWorkspace(repo: any, slot: number, isolatedLabel: strin
       await execAsync(`git clone ${repo.gitUrl} ${repo.name}`, { cwd: projectsDir });
     } else {
       console.log(`[Worker - Slot ${slot}] Git target exists. Pulling latest commits...`);
-      await execAsync(`git fetch --all && git reset --hard origin/main`, { cwd: targetDir });
+      await execAsync(`git fetch --all && (git reset --hard origin/main || git reset --hard origin/master || true)`, { cwd: targetDir });
     }
     await execAsync(`git config user.name "Orkestro Agent" && git config user.email "agent@orkestro.io"`, { cwd: targetDir });
-    await execAsync(`git checkout main || true`, { cwd: targetDir });
+    await execAsync(`(git checkout main || git checkout master || true)`, { cwd: targetDir });
   } catch (e: any) {
     console.error(`[Worker - Slot ${slot}] FATAL: Git sync collapsed on ${repo.name} - ${e.message}`);
     socket.emit("job_log", { cardId, author: "system", message: `Worker Git checkout failed: ${e.message}` });
