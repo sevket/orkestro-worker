@@ -404,7 +404,25 @@ async function startWorker() {
         }
 
         socket.emit("job_log", { cardId, author: "system", message: `\n[Local Agent Exit] code ${code}` });
-        socket.emit("job_complete", { cardId, exitCode: code ?? 1, projectPath, isReview });
+        
+        let errorMessage = null;
+        if (code !== 0) {
+            const apiErrMatch = outputBuffer.match(/API Error[\s\S]*?(\{[\s\S]*?"error":\s*"[^"]+"[\s\S]*?\})/);
+            if (apiErrMatch) {
+               try {
+                  const errObj = JSON.parse(apiErrMatch[1]);
+                  const msg = errObj.message?.content?.[0]?.text || errObj.error || "Bilinmeyen API Hatası";
+                  // Include specific formatting for easy Kanban viewing
+                  errorMessage = `🚨 **Ajan API Hatası (Exit ${code})**:\n${msg}`;
+               } catch(e) {}
+            } else if (outputBuffer.includes("Credit balance is too low") || outputBuffer.includes("rate_limit")) {
+               errorMessage = `🚨 **Ajan API Hatası (Exit ${code})**:\nKredi bakiyesi yetersiz veya Rate-Limit engeli (You've hit your limit).`;
+            } else {
+               errorMessage = `🚨 **Ajan Başarısız (Exit ${code})**:\nAjan beklenmedik bir şekilde çöktü. Lütfen Terminal loglarını inceleyiniz.`;
+            }
+        }
+        
+        socket.emit("job_complete", { cardId, exitCode: code ?? 1, projectPath, isReview, errorMessage });
 
         if (code !== 0) throw new Error(`Agent exited with code ${code}`);
 
