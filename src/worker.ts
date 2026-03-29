@@ -126,6 +126,75 @@ async function discoverCapabilities() {
   return capabilities;
 }
 
+async function testCommand(cmd: string, args: string[]): Promise<{ success: boolean; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync(cmd, args, { timeout: 10000 });
+    return { success: true, stdout, stderr };
+  } catch (err: any) {
+    return { success: false, stdout: err.stdout || "", stderr: err.stderr || err.message };
+  }
+}
+
+async function generateProviderTelemetry() {
+  const providers: Array<{ id: string; status: "green" | "yellow" | "red" | "gray"; message: string }> = [];
+
+  // 1. Claude Check
+  const claudeRes = await testCommand("claude", ["--version"]);
+  if (!claudeRes.success && (claudeRes.stderr.includes("ENOENT") || claudeRes.stderr.includes("not found"))) {
+    providers.push({ id: "claude", status: "gray", message: "Not installed" });
+  } else {
+    // Quick test to see if auth is valid or limit is reached
+    const authRes = await testCommand("claude", ["config", "list"]);
+    const combinedOutput = (authRes.stdout + " " + authRes.stderr).toLowerCase();
+    
+    if (combinedOutput.includes("login") || combinedOutput.includes("unauthorized") || combinedOutput.includes("not logged in")) {
+       providers.push({ id: "claude", status: "yellow", message: "Login needed" });
+    } else if (combinedOutput.includes("limit") || combinedOutput.includes("quota") || combinedOutput.includes("aktif olacak")) {
+       providers.push({ id: "claude", status: "red", message: "Limit Reached / Waiting" });
+    } else {
+       providers.push({ id: "claude", status: "green", message: claudeRes.stdout.trim() || "Ready" });
+    }
+  }
+
+  // 2. Gemini Check
+  const geminiRes = await testCommand("gemini", ["--version"]);
+  if (!geminiRes.success && (geminiRes.stderr.includes("ENOENT") || geminiRes.stderr.includes("not found"))) {
+    providers.push({ id: "gemini", status: "gray", message: "Not installed" });
+  } else {
+    const authRes = await testCommand("gemini", ["config"]);
+    const combinedOutput = (authRes.stdout + " " + authRes.stderr).toLowerCase();
+    if (combinedOutput.includes("key") || combinedOutput.includes("login")) {
+      providers.push({ id: "gemini", status: "yellow", message: "Login / Key needed" });
+    } else {
+      providers.push({ id: "gemini", status: "green", message: geminiRes.stdout.trim().split("\n")[0] || "Ready" });
+    }
+  }
+
+  // 3. OpenCode Check
+  const ocRes = await testCommand("opencode", ["--version"]);
+  if (!ocRes.success && (ocRes.stderr.includes("ENOENT") || ocRes.stderr.includes("not found"))) {
+    providers.push({ id: "opencode", status: "gray", message: "Not installed" });
+  } else {
+    const ocAuth = await testCommand("opencode", ["auth", "status"]);
+    const combinedOutput = (ocAuth.stdout + " " + ocAuth.stderr).toLowerCase();
+    if (combinedOutput.includes("not logged in") || combinedOutput.includes("unauthorized")) {
+       providers.push({ id: "opencode", status: "yellow", message: "Login needed" });
+    } else {
+       providers.push({ id: "opencode", status: "green", message: ocRes.stdout.trim().split("\n")[0] || "Ready" });
+    }
+  }
+
+  // 4. Codex Check
+  const codexRes = await testCommand("codex", ["--version"]);
+  if (!codexRes.success && (codexRes.stderr.includes("ENOENT") || codexRes.stderr.includes("not found"))) {
+     providers.push({ id: "codex", status: "gray", message: "Not installed" });
+  } else {
+     providers.push({ id: "codex", status: "green", message: codexRes.stdout.trim().split("\n")[0] || "Ready" });
+  }
+
+  return providers;
+}
+
 function loadOrCreateWorkerId(): string {
   const idArg = process.argv.find(a => a.startsWith("--id="));
   if (idArg) return idArg.substring(5).trim();
@@ -294,6 +363,21 @@ async function startWorker() {
   console.log(`[Worker] Discovered capabilities: [${capabilities.join(", ")}]`);
   const workerId = loadOrCreateWorkerId();
   const socket = setupMasterConnection(workerId, capabilities);
+
+  // Background Telemetry Task
+  const reportTelemetry = async () => {
+    if (!socket.connected) return;
+    try {
+      const providers = await generateProviderTelemetry();
+      socket.emit("worker_provider_status", { workerId, providers });
+    } catch (e) {
+      console.error("[Worker] Telemetry check failed:", e);
+    }
+  };
+  
+  // Initial report 3 seconds after boot, then every 2 minutes
+  setTimeout(reportTelemetry, 3000);
+  setInterval(reportTelemetry, 120_000);
 
   let workerPersonas: any[] = [];
 
