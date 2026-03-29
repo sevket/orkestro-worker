@@ -189,7 +189,21 @@ async function generateProviderTelemetry() {
   if (!codexRes.success && (codexRes.stderr.includes("ENOENT") || codexRes.stderr.includes("not found"))) {
      providers.push({ id: "codex", status: "gray", message: "Not installed" });
   } else {
-     providers.push({ id: "codex", status: "green", message: codexRes.stdout.trim().split("\n")[0] || "Ready" });
+     let codexAuth = false;
+     try {
+       const authPath = path.join(os.homedir(), ".codex", "auth.json");
+       if (fs.existsSync(authPath)) {
+          const c = fs.readFileSync(authPath, 'utf8');
+          if (c.includes("OPENAI_API_KEY") || c.includes("tokens")) codexAuth = true;
+       }
+     } catch(e) {}
+     if (process.env.OPENAI_API_KEY) codexAuth = true;
+
+     if (!codexAuth) {
+        providers.push({ id: "codex", status: "yellow", message: "Login needed" });
+     } else {
+        providers.push({ id: "codex", status: "green", message: codexRes.stdout.trim().split("\n")[0] || "Ready" });
+     }
   }
 
   return providers;
