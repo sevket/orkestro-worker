@@ -384,8 +384,12 @@ async function startWorker() {
     }
   };
   
-  // Initial report 3 seconds after boot, then every 2 minutes
-  setTimeout(reportTelemetry, 3000);
+  socket.on("connect", () => {
+    // Report immediately upon successful connection
+    setTimeout(reportTelemetry, 1000);
+  });
+  
+  // Also report periodically
   setInterval(reportTelemetry, 120_000);
 
   let workerPersonas: any[] = [];
