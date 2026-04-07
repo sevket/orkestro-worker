@@ -320,13 +320,23 @@ async function spawnAgentProcess(
 ): Promise<{ code: number | null, outputBuffer: string }> {
 
   return new Promise((resolve, reject) => {
-    const { cardId, args } = jobData;
+    const { cardId, args, openaiKey } = jobData;
+
+    // OPENAI_API_KEY priority: 1) Worker env 2) Job-provided key from server
+    const resolvedOpenAIKey = process.env.OPENAI_API_KEY || openaiKey || "";
+
+    const childEnv = {
+      ...process.env,
+      ...(resolvedOpenAIKey ? { OPENAI_API_KEY: resolvedOpenAIKey } : {}),
+    };
+
     const child = spawn(args[0], args.slice(1), {
       cwd: projectPath,
       shell: process.platform === "win32",
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,
+      env: childEnv,
     });
 
     activeProcesses.set(jobIdentifier, child);
