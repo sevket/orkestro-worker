@@ -155,7 +155,7 @@ function setupMasterConnection(workerId: string, capabilities: string[]): Socket
       capabilities: JSON.stringify(capabilities),
       capacity: String(WORKER_ASSIGNED_CAPACITY),
       requestedCapacity: String(WORKER_REQUESTED_CAPACITY),
-      roles: process.env.WORKER_ROLES || '["planner", "coder", "reviewer", "tester"]'
+      roles: process.env.WORKER_DYNAMIC_PERSONAS === "true" ? "[]" : (process.env.WORKER_ROLES || '["planner", "coder", "reviewer", "tester"]')
     }
   });
 
