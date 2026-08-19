@@ -6,6 +6,7 @@ projects/
 .DS_Store
 .agents/
 .serena/
+.claude/
 
 # Test coverage
 coverage
