@@ -114,3 +114,12 @@ pm2 logs orkestro-worker
 
 Once the worker successfully boots, it will emit a connection echo to the Master server. 
 You will see `{Worker Node} is alive and ready to process jobs!` in the master Node console, and the worker will instantly appear in the Orkestro Web UI under the **Fleet** menu!
+
+---
+
+## Contributing
+
+Every change here follows [`AGENTS.md`](AGENTS.md): tests first,
+`npm run verify` before every commit, `CHANGELOG.md` updated in the same commit,
+no secrets in git. Socket, queue and job-payload changes are two-repo changes —
+land the matching update in the `orkestro` master repository at the same time.

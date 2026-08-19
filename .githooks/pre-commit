@@ -1,0 +1,15 @@
+#!/bin/sh
+# Orkestro worker pre-commit gate - AGENTS.md
+set -e
+
+printf '\n[worker] pre-commit: rules\n'
+node scripts/check-changelog.mjs
+node scripts/scan-secrets.mjs
+
+printf '[worker] pre-commit: typecheck\n'
+npm run --silent typecheck
+
+printf '[worker] pre-commit: unit tests\n'
+npm run --silent test:unit
+
+printf '[worker] pre-commit: ok\n\n'

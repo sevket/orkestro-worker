@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: typecheck · test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - run: npm run test:integration
+      - run: npm run test:coverage
+
+  rules:
+    name: development rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Changelog entry present
+        if: github.event_name == 'pull_request'
+        run: |
+          base="origin/${{ github.base_ref }}"
+          changed=$(git diff --name-only "$base"...HEAD)
+          echo "$changed"
+          if echo "$changed" | grep -qE '^(src|scripts)/'; then
+            if ! echo "$changed" | grep -q '^CHANGELOG.md$'; then
+              echo "::error::Source changed but CHANGELOG.md was not updated (AGENTS.md §4)."
+              exit 1
+            fi
+          fi
+
+      - name: No committed secrets
+        run: |
+          if git ls-files | grep -qx '.env'; then
+            echo "::error::.env must never be committed."
+            exit 1
+          fi
