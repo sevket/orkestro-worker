@@ -21,6 +21,11 @@ commit** — the pre-commit hook enforces it.
 - npm scripts: `test`, `test:unit`, `test:integration`, `test:coverage`,
   `typecheck`, `verify`.
 
+### Changed
+- The pre-commit changelog check skips merge commits: requiring an entry for
+  someone else's merged work forced `--no-verify`, which trains people to skip
+  the gate entirely.
+
 ### Fixed
 - A failed agent run with a **nested** API error payload produced no diagnosis
   at all: the non-greedy regex captured an unparseable fragment and the error
