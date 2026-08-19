@@ -1,0 +1,7 @@
+#!/bin/sh
+# Orkestro worker pre-push gate - AGENTS.md
+set -e
+
+printf '\n[worker] pre-push: full verification\n'
+npm run --silent verify
+printf '[worker] pre-push: ok\n\n'

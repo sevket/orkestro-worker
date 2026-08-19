@@ -8,6 +8,9 @@ import { exec, execSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { JsonLogSimplifier } from "./runner.js";
+import { extractPlannerTasks } from "./lib/plannerTasks.js";
+import { computeAssignedCapacity } from "./lib/capacity.js";
+import { describeAgentFailure } from "./lib/agentErrors.js";
 import { Worker } from "bullmq";
 import Redis from "ioredis";
 import { EventEmitter } from "node:events";
@@ -88,13 +91,18 @@ const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
 export const WORKER_REQUESTED_CAPACITY = Number(process.env.WORKER_CAPACITY || "4");
 const _cpus = os.cpus().length;
 const _freeMemGB = os.freemem() / (1024 * 1024 * 1024);
-const _cpuLimit = Math.max(1, _cpus - 1);
-const _memLimit = Math.max(1, Math.floor(_freeMemGB / 1.5));
-const _safeMax = Math.min(_cpuLimit, _memLimit);
 
-export const WORKER_ASSIGNED_CAPACITY = Math.min(WORKER_REQUESTED_CAPACITY, _safeMax);
+const _ignoreLimits = process.env.WORKER_IGNORE_HARDWARE_LIMITS === "true";
+export const WORKER_ASSIGNED_CAPACITY = computeAssignedCapacity({
+  requested: WORKER_REQUESTED_CAPACITY,
+  cpus: _cpus,
+  freeMemGB: _freeMemGB,
+  ignoreHardwareLimits: _ignoreLimits,
+});
 
-if (WORKER_REQUESTED_CAPACITY > WORKER_ASSIGNED_CAPACITY) {
+if (_ignoreLimits) {
+  console.log(`[Worker] Hardware limits explicitly ignored via ENV. Forced Capacity: ${WORKER_ASSIGNED_CAPACITY}`);
+} else if (WORKER_REQUESTED_CAPACITY > WORKER_ASSIGNED_CAPACITY) {
   console.log(`[Worker] Requested capacity ${WORKER_REQUESTED_CAPACITY} exceeds hardware limits. Auto-scaled capacity to ${WORKER_ASSIGNED_CAPACITY} (Constraints - CPUs: ${_cpus}, Free RAM: ${_freeMemGB.toFixed(1)}GB)`);
 } else {
   console.log(`[Worker] Hardware capacity check passed. Assigned Capacity: ${WORKER_ASSIGNED_CAPACITY}`);
@@ -155,7 +163,7 @@ function setupMasterConnection(workerId: string, capabilities: string[]): Socket
       capabilities: JSON.stringify(capabilities),
       capacity: String(WORKER_ASSIGNED_CAPACITY),
       requestedCapacity: String(WORKER_REQUESTED_CAPACITY),
-      roles: process.env.WORKER_ROLES || '["planner", "coder", "reviewer", "tester"]'
+      roles: process.env.WORKER_DYNAMIC_PERSONAS === "true" ? "[]" : (process.env.WORKER_ROLES || '["planner", "coder", "reviewer", "tester"]')
     }
   });
 
@@ -195,43 +203,6 @@ async function prepareGitWorkspace(repo: any, slot: number, isolatedLabel: strin
   return targetDir;
 }
 
-function extractPlannerTasks(fullOutputBuffer: string): any[] | null {
-  /**
-   * AI Context:
-   * Yapay zekalar non-deterministik çıktılar üretebildiği için her zaman saf JSON dönmeyebilirler.
-   * Sistemin direncini artırmak için sırasıyla 3 aşamalı Fallback (yedek) regex Regex çıkarma mekanizması çalışır:
-   * 1. JSON_TASKS_START özel etiketi aranır.
-   * 2. Bulunamazsa Markdown JSON bloğu (```json) aranır
-   * 3. Hiçbiri yoksa ham JSON Array [...] motifi parse edilir.
-   */
-  let jsonStr = "";
-  const customMatch = fullOutputBuffer.match(/\[JSON_TASKS_START\]([\s\S]*?)\[JSON_TASKS_END\]/);
-  if (customMatch && customMatch[1]) {
-    jsonStr = customMatch[1].trim();
-  } else {
-    const mdMatch = fullOutputBuffer.match(/```json\s*([\s\S]*?)\s*```/);
-    if (mdMatch && mdMatch[1]) {
-      jsonStr = mdMatch[1].trim();
-    } else {
-      const arrayMatch = fullOutputBuffer.match(/\[\s*\{[\s\S]*\}\s*\]/);
-      if (arrayMatch && arrayMatch[0]) {
-        jsonStr = arrayMatch[0].trim();
-      }
-    }
-  }
-
-  if (jsonStr) {
-    try {
-      const tasksArray = JSON.parse(jsonStr);
-      if (Array.isArray(tasksArray) && tasksArray.length > 0) {
-        return tasksArray;
-      }
-    } catch (e: any) {
-      console.error("[Worker] Failed to parse Planner JSON block!", e.message);
-    }
-  }
-  return null;
-}
 
 async function spawnAgentProcess(
   jobData: any,
@@ -405,23 +376,8 @@ async function startWorker() {
 
         socket.emit("job_log", { cardId, author: "system", message: `\n[Local Agent Exit] code ${code}` });
         
-        let errorMessage = null;
-        if (code !== 0) {
-            const apiErrMatch = outputBuffer.match(/API Error[\s\S]*?(\{[\s\S]*?"error":\s*"[^"]+"[\s\S]*?\})/);
-            if (apiErrMatch) {
-               try {
-                  const errObj = JSON.parse(apiErrMatch[1]);
-                  const msg = errObj.message?.content?.[0]?.text || errObj.error || "Bilinmeyen API Hatası";
-                  // Include specific formatting for easy Kanban viewing
-                  errorMessage = `🚨 **Ajan API Hatası (Exit ${code})**:\n${msg}`;
-               } catch(e) {}
-            } else if (outputBuffer.includes("Credit balance is too low") || outputBuffer.includes("rate_limit")) {
-               errorMessage = `🚨 **Ajan API Hatası (Exit ${code})**:\nKredi bakiyesi yetersiz veya Rate-Limit engeli (You've hit your limit).`;
-            } else {
-               errorMessage = `🚨 **Ajan Başarısız (Exit ${code})**:\nAjan beklenmedik bir şekilde çöktü. Lütfen Terminal loglarını inceleyiniz.`;
-            }
-        }
-        
+        const errorMessage = code !== 0 ? describeAgentFailure(outputBuffer, code) : null;
+
         socket.emit("job_complete", { cardId, exitCode: code ?? 1, projectPath, isReview, errorMessage });
 
         if (code !== 0) throw new Error(`Agent exited with code ${code}`);
